@@ -1,0 +1,63 @@
+Source: haskell-tar
+Maintainer: Debian Haskell Group <pkg-haskell-maintainers@lists.alioth.debian.org>
+Uploaders: Joachim Breitner <nomeata@debian.org>, Clint Adams <clint@debian.org>
+Priority: optional
+Section: haskell
+Rules-Requires-Root: no
+Build-Depends:
+ cdbs,
+ debhelper (>= 10),
+ ghc (>= 8),
+ ghc-prof,
+ haskell-devscripts (>= 0.13),
+ libghc-bytestring-handle-dev,
+ libghc-quickcheck2-dev,
+ libghc-tasty-dev (>= 0.10),
+ libghc-tasty-quickcheck-dev (>= 0.8),
+Build-Depends-Indep: ghc-doc
+Standards-Version: 4.5.0
+Homepage: https://hackage.haskell.org/package/tar
+Vcs-Browser: https://salsa.debian.org/haskell-team/DHG_packages/tree/master/p/haskell-tar
+Vcs-Git: https://salsa.debian.org/haskell-team/DHG_packages.git [p/haskell-tar]
+
+Package: libghc-tar-dev
+Architecture: any
+Depends: ${haskell:Depends}, ${misc:Depends}, ${shlibs:Depends}
+Suggests: ${haskell:Suggests}
+Provides: ${haskell:Provides}
+Description: reading, writing and manipulating ".tar" archive files${haskell:ShortBlurb}
+ This library is for working with ".tar" archive files. It can read and write a
+ range of common variations of archive format including V7, USTAR, POSIX and
+ GNU formats. It provides support for packing and unpacking portable archives.
+ This makes it suitable for distribution but not backup because details like
+ file ownership and exact permissions are not preserved.
+ .
+ ${haskell:Blurb}
+
+Package: libghc-tar-prof
+Architecture: any
+Depends: ${haskell:Depends}, ${misc:Depends}, ${shlibs:Depends}
+Provides: ${haskell:Provides}
+Description: reading, writing and manipulating ".tar" archive files${haskell:ShortBlurb}
+ This library is for working with ".tar" archive files. It can read and write a
+ range of common variations of archive format including V7, USTAR, POSIX and
+ GNU formats. It provides support for packing and unpacking portable archives.
+ This makes it suitable for distribution but not backup because details like
+ file ownership and exact permissions are not preserved.
+ .
+ ${haskell:Blurb}
+
+Package: libghc-tar-doc
+Architecture: all
+Section: doc
+Depends: ${haskell:Depends}, ${misc:Depends}
+Recommends: ${haskell:Recommends}
+Suggests: ${haskell:Suggests}
+Description: reading, writing and manipulating ".tar" archive files${haskell:ShortBlurb}
+ This library is for working with ".tar" archive files. It can read and write a
+ range of common variations of archive format including V7, USTAR, POSIX and
+ GNU formats. It provides support for packing and unpacking portable archives.
+ This makes it suitable for distribution but not backup because details like
+ file ownership and exact permissions are not preserved.
+ .
+ ${haskell:Blurb}
