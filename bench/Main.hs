@@ -4,10 +4,13 @@ import qualified Codec.Archive.Tar       as Tar
 import qualified Codec.Archive.Tar.Index as TarIndex
 
 import qualified Data.ByteString.Lazy    as BS
+import Data.Maybe
 import Control.Exception
+import System.Directory
+import System.Environment
+import System.IO.Temp
 
-import Criterion
-import Criterion.Main
+import Test.Tasty.Bench
 
 main = defaultMain benchmarks
 
@@ -24,11 +27,24 @@ benchmarks =
 
   , env loadTarIndex $ \entries ->
       bench "index rebuild" (nf (TarIndex.finalise . TarIndex.unfinalise) entries)
+
+  , env loadTarEntries $ \entries ->
+      bench "unpack" (nfIO $ withSystemTempDirectory "tar-bench" $ \baseDir -> Tar.unpack baseDir entries)
+
+  , env (fmap TarIndex.serialise  loadTarIndex) $ \tarfile ->
+      bench "deserialise index" (nf TarIndex.deserialise tarfile)
   ]
 
 loadTarFile :: IO BS.ByteString
-loadTarFile =
-    BS.readFile "01-index.tar"
+loadTarFile = do
+    mTarFile <- lookupEnv "TAR_TEST_FILE"
+    let tarFile = fromMaybe "01-index.tar" mTarFile
+    exists <- doesFileExist tarFile
+    if exists
+      then BS.readFile tarFile
+      else case mTarFile of
+             Just _ -> error $ tarFile <> " does not exist"
+             Nothing -> error "01-index.tar does not exist, copy it from ~/.cabal/packages/hackage.haskell.org/01-index.tar"
 
 loadTarEntries :: IO (Tar.Entries Tar.FormatError)
 loadTarEntries =

@@ -1,4 +1,12 @@
-{-# LANGUAGE CPP, GeneralizedNewtypeDeriving, BangPatterns #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE PackageImports #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_HADDOCK hide #-}
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Codec.Archive.Tar.Types
@@ -16,9 +24,11 @@
 -----------------------------------------------------------------------------
 module Codec.Archive.Tar.Types (
 
-  Entry(..),
+  GenEntry(..),
+  Entry,
   entryPath,
-  EntryContent(..),
+  GenEntryContent(..),
+  EntryContent,
   FileSize,
   Permissions,
   Ownership(..),
@@ -29,81 +39,99 @@ module Codec.Archive.Tar.Types (
   Format(..),
 
   simpleEntry,
+  longLinkEntry,
+  longSymLinkEntry,
   fileEntry,
+  symlinkEntry,
   directoryEntry,
 
   ordinaryFilePermissions,
+  symbolicLinkPermission,
   executableFilePermissions,
   directoryPermissions,
 
   TarPath(..),
   toTarPath,
+  toTarPath',
+  ToTarPathResult(..),
   fromTarPath,
   fromTarPathToPosixPath,
   fromTarPathToWindowsPath,
+  fromFilePathToNative,
 
   LinkTarget(..),
   toLinkTarget,
   fromLinkTarget,
   fromLinkTargetToPosixPath,
   fromLinkTargetToWindowsPath,
+  fromFilePathToWindowsPath,
 
-  Entries(..),
+  GenEntries(..),
+  Entries,
   mapEntries,
   mapEntriesNoFail,
   foldEntries,
   foldlEntries,
   unfoldEntries,
-
-#ifdef TESTS
-  limitToV7FormatCompat
-#endif
+  unfoldEntriesM,
   ) where
 
 import Data.Int      (Int64)
+import Data.List.NonEmpty (NonEmpty(..))
 import Data.Monoid   (Monoid(..))
 import Data.Semigroup as Sem
+import Data.Typeable
 import qualified Data.ByteString       as BS
 import qualified Data.ByteString.Char8 as BS.Char8
 import qualified Data.ByteString.Lazy  as LBS
 import Control.DeepSeq
+import Control.Exception (Exception, displayException)
 
 import qualified System.FilePath as FilePath.Native
-         ( joinPath, splitDirectories, addTrailingPathSeparator )
+         ( joinPath, splitDirectories, addTrailingPathSeparator, hasTrailingPathSeparator, pathSeparator, isAbsolute, hasTrailingPathSeparator )
 import qualified System.FilePath.Posix as FilePath.Posix
          ( joinPath, splitPath, splitDirectories, hasTrailingPathSeparator
-         , addTrailingPathSeparator )
+         , addTrailingPathSeparator, pathSeparator )
 import qualified System.FilePath.Windows as FilePath.Windows
-         ( joinPath, addTrailingPathSeparator )
+         ( joinPath, addTrailingPathSeparator, pathSeparator )
 import System.Posix.Types
          ( FileMode )
+import "os-string" System.OsString.Posix (PosixString, PosixChar)
+import qualified "os-string" System.OsString.Posix as PS
 
-#ifdef TESTS
-import Test.QuickCheck
-import Control.Applicative ((<$>), (<*>), pure)
-import Data.Word (Word16)
-#endif
+import Codec.Archive.Tar.PackAscii
 
-
+-- | File size in bytes.
 type FileSize  = Int64
--- | The number of seconds since the UNIX epoch
+
+-- | The number of seconds since the UNIX epoch.
 type EpochTime = Int64
+
+-- | Major device number.
 type DevMajor  = Int
+
+-- | Minor device number.
 type DevMinor  = Int
+
+-- | User-defined tar format expansion.
 type TypeCode  = Char
+
+-- | Permissions information for 'GenEntry'.
 type Permissions = FileMode
 
--- | Tar archive entry.
+-- | Polymorphic tar archive entry. High-level interfaces
+-- commonly work with 'GenEntry' 'FilePath' 'FilePath',
+-- while low-level ones use 'GenEntry' t'TarPath' t'LinkTarget'.
 --
-data Entry = Entry {
+-- @since 0.6.0.0
+data GenEntry tarPath linkTarget = Entry {
 
-    -- | The path of the file or directory within the archive. This is in a
-    -- tar-specific form. Use 'entryPath' to get a native 'FilePath'.
-    entryTarPath :: {-# UNPACK #-} !TarPath,
+    -- | The path of the file or directory within the archive.
+    entryTarPath :: !tarPath,
 
     -- | The real content of the entry. For 'NormalFile' this includes the
     -- file data. An entry usually contains a 'NormalFile' or a 'Directory'.
-    entryContent :: !EntryContent,
+    entryContent :: !(GenEntryContent linkTarget),
 
     -- | File permissions (Unix style file mode).
     entryPermissions :: {-# UNPACK #-} !Permissions,
@@ -119,33 +147,51 @@ data Entry = Entry {
   }
   deriving (Eq, Show)
 
--- | Native 'FilePath' of the file or directory within the archive.
+-- | Monomorphic tar archive entry, ready for serialization / deserialization.
 --
-entryPath :: Entry -> FilePath
+type Entry = GenEntry TarPath LinkTarget
+
+-- | Low-level function to get a native 'FilePath' of the file or directory
+-- within the archive, not accounting for long names. It's likely
+-- that you want to apply 'Codec.Archive.Tar.decodeLongNames'
+-- and use 'Codec.Archive.Tar.Entry.entryTarPath' afterwards instead of 'entryPath'.
+--
+entryPath :: GenEntry TarPath linkTarget -> FilePath
 entryPath = fromTarPath . entryTarPath
 
--- | The content of a tar archive entry, which depends on the type of entry.
+-- | Polymorphic content of a tar archive entry. High-level interfaces
+-- commonly work with 'GenEntryContent' 'FilePath',
+-- while low-level ones use 'GenEntryContent' t'LinkTarget'.
 --
 -- Portable archives should contain only 'NormalFile' and 'Directory'.
 --
-data EntryContent = NormalFile      LBS.ByteString {-# UNPACK #-} !FileSize
-                  | Directory
-                  | SymbolicLink    !LinkTarget
-                  | HardLink        !LinkTarget
-                  | CharacterDevice {-# UNPACK #-} !DevMajor
-                                    {-# UNPACK #-} !DevMinor
-                  | BlockDevice     {-# UNPACK #-} !DevMajor
-                                    {-# UNPACK #-} !DevMinor
-                  | NamedPipe
-                  | OtherEntryType  {-# UNPACK #-} !TypeCode LBS.ByteString
-                                    {-# UNPACK #-} !FileSize
-    deriving (Eq, Ord, Show)
+-- @since 0.6.0.0
+data GenEntryContent linkTarget
+  = NormalFile      LBS.ByteString {-# UNPACK #-} !FileSize
+  | Directory
+  | SymbolicLink    !linkTarget
+  | HardLink        !linkTarget
+  | CharacterDevice {-# UNPACK #-} !DevMajor
+                    {-# UNPACK #-} !DevMinor
+  | BlockDevice     {-# UNPACK #-} !DevMajor
+                    {-# UNPACK #-} !DevMinor
+  | NamedPipe
+  | OtherEntryType  {-# UNPACK #-} !TypeCode LBS.ByteString
+                    {-# UNPACK #-} !FileSize
+  deriving (Eq, Ord, Show)
 
+-- | Monomorphic content of a tar archive entry,
+-- ready for serialization / deserialization.
+type EntryContent = GenEntryContent LinkTarget
+
+-- | Ownership information for 'GenEntry'.
 data Ownership = Ownership {
     -- | The owner user name. Should be set to @\"\"@ if unknown.
+    -- Must not contain non-ASCII characters.
     ownerName :: String,
 
     -- | The owner group name. Should be set to @\"\"@ if unknown.
+    -- Must not contain non-ASCII characters.
     groupName :: String,
 
     -- | Numeric owner user id. Should be set to @0@ if unknown.
@@ -169,30 +215,24 @@ data Format =
      -- | The \"USTAR\" format is an extension of the classic V7 format. It was
      -- later standardised by POSIX. It has some restrictions but is the most
      -- portable format.
-     --
    | UstarFormat
 
      -- | The GNU tar implementation also extends the classic V7 format, though
-     -- in a slightly different way from the USTAR format. In general for new
-     -- archives the standard USTAR/POSIX should be used.
-     --
+     -- in a slightly different way from the USTAR format. This is the only format
+     -- supporting long file names.
    | GnuFormat
   deriving (Eq, Ord, Show)
 
-instance NFData Entry where
-  rnf (Entry _ c _ _ _ _) = rnf c
+instance (NFData tarPath, NFData linkTarget) => NFData (GenEntry tarPath linkTarget) where
+  rnf (Entry p c _ _ _ _) = rnf p `seq` rnf c
 
-instance NFData EntryContent where
+instance NFData linkTarget => NFData (GenEntryContent linkTarget) where
   rnf x = case x of
-      NormalFile       c _  -> rnflbs c
-      OtherEntryType _ c _  -> rnflbs c
+      NormalFile       c _  -> rnf c
+      SymbolicLink lnk      -> rnf lnk
+      HardLink lnk          -> rnf lnk
+      OtherEntryType _ c _  -> rnf c
       _                     -> seq x ()
-    where
-#if MIN_VERSION_bytestring(0,10,0)
-      rnflbs = rnf
-#else
-      rnflbs = foldr (\ !_bs r -> r) () . LBS.toChunks
-#endif
 
 instance NFData Ownership where
   rnf (Ownership o g _ _) = rnf o `seq` rnf g
@@ -200,6 +240,12 @@ instance NFData Ownership where
 -- | @rw-r--r--@ for normal files
 ordinaryFilePermissions :: Permissions
 ordinaryFilePermissions   = 0o0644
+
+-- | @rw-r--r--@ for normal files
+--
+-- @since 0.6.0.0
+symbolicLinkPermission :: Permissions
+symbolicLinkPermission   = 0o0777
 
 -- | @rwxr-xr-x@ for executable files
 executableFilePermissions :: Permissions
@@ -209,26 +255,27 @@ executableFilePermissions = 0o0755
 directoryPermissions :: Permissions
 directoryPermissions  = 0o0755
 
--- | An 'Entry' with all default values except for the file name and type. It
--- uses the portable USTAR/POSIX format (see 'UstarHeader').
+-- | An entry with all default values except for the file name and type. It
+-- uses the portable USTAR/POSIX format (see 'UstarFormat').
 --
 -- You can use this as a basis and override specific fields, eg:
 --
 -- > (emptyEntry name HardLink) { linkTarget = target }
 --
-simpleEntry :: TarPath -> EntryContent -> Entry
+simpleEntry :: tarPath -> GenEntryContent linkTarget -> GenEntry tarPath linkTarget
 simpleEntry tarpath content = Entry {
     entryTarPath     = tarpath,
     entryContent     = content,
     entryPermissions = case content of
                          Directory -> directoryPermissions
+                         SymbolicLink _ -> symbolicLinkPermission
                          _         -> ordinaryFilePermissions,
     entryOwnership   = Ownership "" "" 0 0,
     entryTime        = 0,
     entryFormat      = UstarFormat
   }
 
--- | A tar 'Entry' for a file.
+-- | A tar entry for a file.
 --
 -- Entry  fields such as file permissions and ownership have default values.
 --
@@ -237,15 +284,56 @@ simpleEntry tarpath content = Entry {
 --
 -- > (fileEntry name content) { fileMode = executableFileMode }
 --
-fileEntry :: TarPath -> LBS.ByteString -> Entry
+fileEntry :: tarPath -> LBS.ByteString -> GenEntry tarPath linkTarget
 fileEntry name fileContent =
   simpleEntry name (NormalFile fileContent (LBS.length fileContent))
 
--- | A tar 'Entry' for a directory.
+-- | A tar entry for a symbolic link.
+symlinkEntry :: tarPath -> linkTarget -> GenEntry tarPath linkTarget
+symlinkEntry name targetLink =
+  simpleEntry name (SymbolicLink targetLink)
+
+-- | [GNU extension](https://www.gnu.org/software/tar/manual/html_node/Standard.html)
+-- to store a filepath too long to fit into 'Codec.Archive.Tar.Entry.entryTarPath'
+-- as 'OtherEntryType' @\'L\'@ with the full filepath as 'entryContent'.
+-- The next entry must contain the actual
+-- data with truncated 'Codec.Archive.Tar.Entry.entryTarPath'.
+--
+-- See [What exactly is the GNU tar ././@LongLink "trick"?](https://stackoverflow.com/questions/2078778/what-exactly-is-the-gnu-tar-longlink-trick)
+--
+-- @since 0.6.0.0
+longLinkEntry :: FilePath -> GenEntry TarPath linkTarget
+longLinkEntry tarpath = Entry {
+    entryTarPath     = TarPath [PS.pstr|././@LongLink|] mempty,
+    entryContent     = OtherEntryType 'L' (LBS.fromStrict $ posixToByteString $ toPosixString tarpath) (fromIntegral $ length tarpath),
+    entryPermissions = ordinaryFilePermissions,
+    entryOwnership   = Ownership "" "" 0 0,
+    entryTime        = 0,
+    entryFormat      = GnuFormat
+  }
+
+-- | [GNU extension](https://www.gnu.org/software/tar/manual/html_node/Standard.html)
+-- to store a link target too long to fit into 'Codec.Archive.Tar.Entry.entryTarPath'
+-- as 'OtherEntryType' @\'K\'@ with the full filepath as 'entryContent'.
+-- The next entry must contain the actual
+-- data with truncated 'Codec.Archive.Tar.Entry.entryTarPath'.
+--
+-- @since 0.6.0.0
+longSymLinkEntry :: FilePath -> GenEntry TarPath linkTarget
+longSymLinkEntry linkTarget = Entry {
+    entryTarPath     = TarPath [PS.pstr|././@LongLink|] mempty,
+    entryContent     = OtherEntryType 'K' (LBS.fromStrict $ posixToByteString $ toPosixString $ linkTarget) (fromIntegral $ length linkTarget),
+    entryPermissions = ordinaryFilePermissions,
+    entryOwnership   = Ownership "" "" 0 0,
+    entryTime        = 0,
+    entryFormat      = GnuFormat
+  }
+
+-- | A tar entry for a directory.
 --
 -- Entry fields such as file permissions and ownership have default values.
 --
-directoryEntry :: TarPath -> Entry
+directoryEntry :: tarPath -> GenEntry tarPath linkTarget
 directoryEntry name = simpleEntry name Directory
 
 --
@@ -276,8 +364,11 @@ directoryEntry name = simpleEntry name Directory
 --
 -- * The directory separator between the prefix and name is /not/ stored.
 --
-data TarPath = TarPath {-# UNPACK #-} !BS.ByteString -- path name, 100 characters max.
-                       {-# UNPACK #-} !BS.ByteString -- path prefix, 155 characters max.
+data TarPath = TarPath
+  {-# UNPACK #-} !PosixString
+  -- ^ path name, 100 characters max.
+  {-# UNPACK #-} !PosixString
+  -- ^ path prefix, 155 characters max.
   deriving (Eq, Ord)
 
 instance NFData TarPath where
@@ -286,7 +377,7 @@ instance NFData TarPath where
 instance Show TarPath where
   show = show . fromTarPath
 
--- | Convert a 'TarPath' to a native 'FilePath'.
+-- | Convert a t'TarPath' to a native 'FilePath'.
 --
 -- The native 'FilePath' will use the native directory separator but it is not
 -- otherwise checked for validity or sanity. In particular:
@@ -296,72 +387,89 @@ instance Show TarPath where
 --
 -- * The tar path may be an absolute path or may contain @\"..\"@ components.
 --   For security reasons this should not usually be allowed, but it is your
---   responsibility to check for these conditions (eg using 'checkSecurity').
+--   responsibility to check for these conditions
+--   (e.g., using 'Codec.Archive.Tar.Check.checkEntrySecurity').
 --
 fromTarPath :: TarPath -> FilePath
-fromTarPath (TarPath namebs prefixbs) = adjustDirectory $
-  FilePath.Native.joinPath $ FilePath.Posix.splitDirectories prefix
-                          ++ FilePath.Posix.splitDirectories name
-  where
-    name   = BS.Char8.unpack namebs
-    prefix = BS.Char8.unpack prefixbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator name
-                    = FilePath.Native.addTrailingPathSeparator
-                    | otherwise = id
+fromTarPath = fromPosixString . fromTarPathInternal (PS.unsafeFromChar FilePath.Native.pathSeparator)
 
--- | Convert a 'TarPath' to a Unix\/Posix 'FilePath'.
+-- | Convert a t'TarPath' to a Unix\/Posix 'FilePath'.
 --
 -- The difference compared to 'fromTarPath' is that it always returns a Unix
 -- style path irrespective of the current operating system.
 --
--- This is useful to check how a 'TarPath' would be interpreted on a specific
+-- This is useful to check how a t'TarPath' would be interpreted on a specific
 -- operating system, eg to perform portability checks.
 --
 fromTarPathToPosixPath :: TarPath -> FilePath
-fromTarPathToPosixPath (TarPath namebs prefixbs) = adjustDirectory $
-  FilePath.Posix.joinPath $ FilePath.Posix.splitDirectories prefix
-                         ++ FilePath.Posix.splitDirectories name
-  where
-    name   = BS.Char8.unpack namebs
-    prefix = BS.Char8.unpack prefixbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator name
-                    = FilePath.Posix.addTrailingPathSeparator
-                    | otherwise = id
+fromTarPathToPosixPath = fromPosixString . fromTarPathInternal (PS.unsafeFromChar FilePath.Posix.pathSeparator)
 
--- | Convert a 'TarPath' to a Windows 'FilePath'.
+-- | Convert a t'TarPath' to a Windows 'FilePath'.
 --
 -- The only difference compared to 'fromTarPath' is that it always returns a
 -- Windows style path irrespective of the current operating system.
 --
--- This is useful to check how a 'TarPath' would be interpreted on a specific
+-- This is useful to check how a t'TarPath' would be interpreted on a specific
 -- operating system, eg to perform portability checks.
 --
 fromTarPathToWindowsPath :: TarPath -> FilePath
-fromTarPathToWindowsPath (TarPath namebs prefixbs) = adjustDirectory $
-  FilePath.Windows.joinPath $ FilePath.Posix.splitDirectories prefix
-                           ++ FilePath.Posix.splitDirectories name
-  where
-    name   = BS.Char8.unpack namebs
-    prefix = BS.Char8.unpack prefixbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator name
-                    = FilePath.Windows.addTrailingPathSeparator
-                    | otherwise = id
+fromTarPathToWindowsPath = fromPosixString . fromTarPathInternal (PS.unsafeFromChar FilePath.Windows.pathSeparator)
 
--- | Convert a native 'FilePath' to a 'TarPath'.
---
--- The conversion may fail if the 'FilePath' is too long. See 'TarPath' for a
--- description of the problem with splitting long 'FilePath's.
---
-toTarPath :: Bool -- ^ Is the path for a directory? This is needed because for
-                  -- directories a 'TarPath' must always use a trailing @\/@.
-          -> FilePath -> Either String TarPath
-toTarPath isDir = splitLongPath
-                . addTrailingSep
-                . FilePath.Posix.joinPath
-                . FilePath.Native.splitDirectories
+fromTarPathInternal :: PosixChar -> TarPath -> PosixString
+fromTarPathInternal sep = go
   where
-    addTrailingSep | isDir     = FilePath.Posix.addTrailingPathSeparator
-                   | otherwise = id
+    posixSep = PS.unsafeFromChar FilePath.Posix.pathSeparator
+    adjustSeps = if sep == posixSep then id else
+      PS.map $ \c -> if c == posixSep then sep else c
+    go (TarPath name prefix)
+     | PS.null prefix = adjustSeps name
+     | PS.null name = adjustSeps prefix
+     | otherwise = adjustSeps prefix <> PS.cons sep (adjustSeps name)
+{-# INLINE fromTarPathInternal #-}
+
+-- | Convert a native 'FilePath' to a t'TarPath'.
+--
+-- The conversion may fail if the 'FilePath' is empty or too long.
+toTarPath :: Bool -- ^ Is the path for a directory? This is needed because for
+                  -- directories a t'TarPath' must always use a trailing @\/@.
+          -> FilePath
+          -> Either String TarPath
+toTarPath isDir path = case toTarPath' path' of
+  FileNameEmpty      -> Left "File name empty"
+  FileNameOK tarPath -> Right tarPath
+  FileNameTooLong{}  -> Left "File name too long"
+  where
+    path' = if isDir && not (FilePath.Native.hasTrailingPathSeparator path)
+            then path <> [FilePath.Native.pathSeparator]
+            else path
+
+-- | Convert a native 'FilePath' to a t'TarPath'.
+-- Directory paths must always have a trailing @\/@, this is not checked.
+--
+-- @since 0.6.0.0
+toTarPath'
+  :: FilePath
+  -> ToTarPathResult
+toTarPath'
+  = splitLongPath
+  . (if nativeSep == posixSep then id else adjustSeps)
+  where
+    nativeSep = FilePath.Native.pathSeparator
+    posixSep = FilePath.Posix.pathSeparator
+    adjustSeps = map $ \c -> if c == nativeSep then posixSep else c
+
+-- | Return type of 'toTarPath''.
+--
+-- @since 0.6.0.0
+data ToTarPathResult
+  = FileNameEmpty
+  -- ^ 'FilePath' was empty, but t'TarPath' must be non-empty.
+  | FileNameOK TarPath
+  -- ^ All good, this is just a normal t'TarPath'.
+  | FileNameTooLong TarPath
+  -- ^ 'FilePath' was longer than 255 characters, t'TarPath' contains
+  -- a truncated part only. An actual entry must be preceded by
+  -- 'longLinkEntry'.
 
 -- | Take a sanitised path, split on directory separators and try to pack it
 -- into the 155 + 100 tar file name format.
@@ -369,33 +477,32 @@ toTarPath isDir = splitLongPath
 -- The strategy is this: take the name-directory components in reverse order
 -- and try to fit as many components into the 100 long name area as possible.
 -- If all the remaining components fit in the 155 name area then we win.
---
-splitLongPath :: FilePath -> Either String TarPath
-splitLongPath path =
-  case packName nameMax (reverse (FilePath.Posix.splitPath path)) of
-    Left err                 -> Left err
-    Right (name, [])         -> Right $! TarPath (BS.Char8.pack name)
-                                                  BS.empty
-    Right (name, first:rest) -> case packName prefixMax remainder of
-      Left err               -> Left err
-      Right (_     , (_:_))  -> Left "File name too long (cannot split)"
-      Right (prefix, [])     -> Right $! TarPath (BS.Char8.pack name)
-                                                 (BS.Char8.pack prefix)
+splitLongPath :: FilePath -> ToTarPathResult
+splitLongPath path = case reverse (FilePath.Posix.splitPath path) of
+  [] -> FileNameEmpty
+  c : cs -> case packName nameMax (c :| cs) of
+    Nothing                 -> FileNameTooLong $ TarPath (toPosixString $ take 100 path) mempty
+    Just (name, [])         -> FileNameOK $! TarPath (toPosixString name) mempty
+    Just (name, first:rest) -> case packName prefixMax remainder of
+      Nothing               -> FileNameTooLong $ TarPath (toPosixString $ take 100 path) mempty
+      Just (_     , _:_)    -> FileNameTooLong $ TarPath (toPosixString $ take 100 path) mempty
+      Just (prefix, [])     -> FileNameOK $! TarPath (toPosixString name) (toPosixString prefix)
       where
         -- drop the '/' between the name and prefix:
-        remainder = init first : rest
+        remainder = init first :| rest
 
   where
     nameMax, prefixMax :: Int
     nameMax   = 100
     prefixMax = 155
 
-    packName _      []     = Left "File name empty"
-    packName maxLen (c:cs)
-      | n > maxLen         = Left "File name too long"
-      | otherwise          = Right (packName' maxLen n [c] cs)
+    packName :: Int -> NonEmpty FilePath -> Maybe (FilePath, [FilePath])
+    packName maxLen (c :| cs)
+      | n > maxLen         = Nothing
+      | otherwise          = Just (packName' maxLen n [c] cs)
       where n = length c
 
+    packName' :: Int -> Int -> [FilePath] -> [FilePath] -> (FilePath, [FilePath])
     packName' maxLen n ok (c:cs)
       | n' <= maxLen             = packName' maxLen n' (c:ok) cs
                                      where n' = n + length c
@@ -404,69 +511,83 @@ splitLongPath path =
 -- | The tar format allows just 100 ASCII characters for the 'SymbolicLink' and
 -- 'HardLink' entry types.
 --
-newtype LinkTarget = LinkTarget BS.ByteString
+newtype LinkTarget = LinkTarget PosixString
   deriving (Eq, Ord, Show)
 
 instance NFData LinkTarget where
-#if MIN_VERSION_bytestring(0,10,0)
     rnf (LinkTarget bs) = rnf bs
-#else
-    rnf (LinkTarget !_bs) = ()
-#endif
 
--- | Convert a native 'FilePath' to a tar 'LinkTarget'. This may fail if the
+-- | Convert a native 'FilePath' to a tar t'LinkTarget'.
 -- string is longer than 100 characters or if it contains non-portable
 -- characters.
---
-toLinkTarget   :: FilePath -> Maybe LinkTarget
-toLinkTarget path | length path <= 100 = Just $! LinkTarget (BS.Char8.pack path)
-                  | otherwise          = Nothing
+toLinkTarget :: FilePath -> Maybe LinkTarget
+toLinkTarget path
+  | length path <= 100 = do
+    target <- toLinkTarget' path
+    Just $! LinkTarget (toPosixString target)
+  | otherwise = Nothing
 
--- | Convert a tar 'LinkTarget' to a native 'FilePath'.
---
+data LinkTargetException = IsAbsolute FilePath
+                         | TooLong FilePath
+  deriving (Show,Typeable)
+
+instance Exception LinkTargetException where
+  displayException (IsAbsolute fp) = "Link target \"" <> fp <> "\" is unexpectedly absolute"
+  displayException (TooLong _) = "The link target is too long"
+
+-- | Convert a native 'FilePath' to a unix filepath suitable for
+-- using as t'LinkTarget'. Does not error if longer than 100 characters.
+toLinkTarget' :: FilePath -> Maybe FilePath
+toLinkTarget' path
+  | FilePath.Native.isAbsolute path = Nothing
+  | otherwise = Just $ adjustDirectory $ FilePath.Posix.joinPath $ FilePath.Native.splitDirectories path
+  where
+    adjustDirectory | FilePath.Native.hasTrailingPathSeparator path
+                    = FilePath.Posix.addTrailingPathSeparator
+                    | otherwise = id
+
+-- | Convert a tar t'LinkTarget' to a native 'FilePath'.
 fromLinkTarget :: LinkTarget -> FilePath
-fromLinkTarget (LinkTarget pathbs) = adjustDirectory $
-  FilePath.Native.joinPath $ FilePath.Posix.splitDirectories path
-  where
-    path = BS.Char8.unpack pathbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator path
-                    = FilePath.Native.addTrailingPathSeparator
-                    | otherwise = id
+fromLinkTarget (LinkTarget pathbs) = fromFilePathToNative $ fromPosixString pathbs
 
--- | Convert a tar 'LinkTarget' to a Unix/Posix 'FilePath'.
---
+-- | Convert a tar t'LinkTarget' to a Unix\/POSIX 'FilePath' (@\'/\'@ path separators).
 fromLinkTargetToPosixPath :: LinkTarget -> FilePath
-fromLinkTargetToPosixPath (LinkTarget pathbs) = adjustDirectory $
-  FilePath.Posix.joinPath $ FilePath.Posix.splitDirectories path
-  where
-    path = BS.Char8.unpack pathbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator path
-                    = FilePath.Native.addTrailingPathSeparator
-                    | otherwise = id
+fromLinkTargetToPosixPath (LinkTarget pathbs) = fromPosixString pathbs
 
--- | Convert a tar 'LinkTarget' to a Windows 'FilePath'.
---
+-- | Convert a tar t'LinkTarget' to a Windows 'FilePath' (@\'\\\\\'@ path separators).
 fromLinkTargetToWindowsPath :: LinkTarget -> FilePath
-fromLinkTargetToWindowsPath (LinkTarget pathbs) = adjustDirectory $
-  FilePath.Windows.joinPath $ FilePath.Posix.splitDirectories path
+fromLinkTargetToWindowsPath (LinkTarget pathbs) =
+  fromFilePathToWindowsPath $ fromPosixString pathbs
+
+-- | Convert a unix FilePath to a native 'FilePath'.
+fromFilePathToNative :: FilePath -> FilePath
+fromFilePathToNative =
+  fromFilePathInternal FilePath.Posix.pathSeparator FilePath.Native.pathSeparator
+
+-- | Convert a unix FilePath to a Windows 'FilePath'.
+fromFilePathToWindowsPath :: FilePath -> FilePath
+fromFilePathToWindowsPath =
+  fromFilePathInternal FilePath.Posix.pathSeparator FilePath.Windows.pathSeparator
+
+fromFilePathInternal :: Char -> Char -> FilePath -> FilePath
+fromFilePathInternal fromSep toSep = adjustSeps
   where
-    path = BS.Char8.unpack pathbs
-    adjustDirectory | FilePath.Posix.hasTrailingPathSeparator path
-                    = FilePath.Windows.addTrailingPathSeparator
-                    | otherwise = id
+    adjustSeps = if fromSep == toSep then id else
+      map $ \c -> if c == fromSep then toSep else c
+{-# INLINE fromFilePathInternal #-}
 
 --
 -- * Entries type
 --
 
--- | A tar archive is a sequence of entries.
+-- | Polymorphic sequence of archive entries.
+-- High-level interfaces
+-- commonly work with 'GenEntries' 'FilePath' 'FilePath',
+-- while low-level ones use 'GenEntries' t'TarPath' t'LinkTarget'.
 --
 -- The point of this type as opposed to just using a list is that it makes the
 -- failure case explicit. We need this because the sequence of entries we get
 -- from reading a tarball can include errors.
---
--- It is a concrete data type so you can manipulate it directly but it is often
--- clearer to use the provided functions for mapping, folding and unfolding.
 --
 -- Converting from a list can be done with just @foldr Next Done@. Converting
 -- back into a list can be done with 'foldEntries' however in that case you
@@ -475,21 +596,36 @@ fromLinkTargetToWindowsPath (LinkTarget pathbs) = adjustDirectory $
 -- The 'Monoid' instance lets you concatenate archives or append entries to an
 -- archive.
 --
-data Entries e = Next Entry (Entries e)
-               | Done
-               | Fail e
-  deriving (Eq, Show)
+-- @since 0.6.0.0
+data GenEntries tarPath linkTarget e
+  = Next (GenEntry tarPath linkTarget) (GenEntries tarPath linkTarget e)
+  | Done
+  | Fail e
+  deriving
+    ( Eq
+    , Show
+    , Functor
+    , Foldable    -- ^ @since 0.6.0.0
+    , Traversable -- ^ @since 0.6.0.0
+    )
 
 infixr 5 `Next`
 
--- | This is like the standard 'unfoldr' function on lists, but for 'Entries'.
+-- | Monomorphic sequence of archive entries,
+-- ready for serialization / deserialization.
+type Entries e = GenEntries TarPath LinkTarget e
+
+-- | This is like the standard 'Data.List.unfoldr' function on lists, but for 'Entries'.
 -- It includes failure as an extra possibility that the stepper function may
 -- return.
 --
 -- It can be used to generate 'Entries' from some other type. For example it is
 -- used internally to lazily unfold entries from a 'LBS.ByteString'.
 --
-unfoldEntries :: (a -> Either e (Maybe (Entry, a))) -> a -> Entries e
+unfoldEntries
+  :: (a -> Either e (Maybe (GenEntry tarPath linkTarget, a)))
+  -> a
+  -> GenEntries tarPath linkTarget e
 unfoldEntries f = unfold
   where
     unfold x = case f x of
@@ -497,211 +633,86 @@ unfoldEntries f = unfold
       Right Nothing        -> Done
       Right (Just (e, x')) -> Next e (unfold x')
 
--- | This is like the standard 'foldr' function on lists, but for 'Entries'.
--- Compared to 'foldr' it takes an extra function to account for the
+unfoldEntriesM
+  :: Monad m
+  => (forall a. m a -> m a)
+  -- ^ id or unsafeInterleaveIO
+  -> m (Either e (Maybe (GenEntry tarPath linkTarget)))
+  -> m (GenEntries tarPath linkTarget e)
+unfoldEntriesM interleave f = unfold
+  where
+    unfold = do
+      f' <- f
+      case f' of
+        Left err       -> pure $ Fail err
+        Right Nothing  -> pure Done
+        Right (Just e) -> Next e <$> interleave unfold
+
+-- | This is like the standard 'Data.List.foldr' function on lists, but for 'Entries'.
+-- Compared to 'Data.List.foldr' it takes an extra function to account for the
 -- possibility of failure.
 --
 -- This is used to consume a sequence of entries. For example it could be used
 -- to scan a tarball for problems or to collect an index of the contents.
 --
-foldEntries :: (Entry -> a -> a) -> a -> (e -> a) -> Entries e -> a
+foldEntries
+  :: (GenEntry tarPath linkTarget -> a -> a)
+  -> a
+  -> (e -> a)
+  -> GenEntries tarPath linkTarget e -> a
 foldEntries next done fail' = fold
   where
     fold (Next e es) = next e (fold es)
     fold Done        = done
     fold (Fail err)  = fail' err
 
--- | A 'foldl'-like function on Entries. It either returns the final
+-- | A 'Data.List.foldl'-like function on Entries. It either returns the final
 -- accumulator result, or the failure along with the intermediate accumulator
 -- value.
 --
-foldlEntries :: (a -> Entry -> a) -> a -> Entries e -> Either (e, a) a
-foldlEntries f z = go z
+foldlEntries
+  :: (a -> GenEntry tarPath linkTarget -> a)
+  -> a
+  -> GenEntries tarPath linkTarget e
+  -> Either (e, a) a
+foldlEntries f = go
   where
     go !acc (Next e es) = go (f acc e) es
     go !acc  Done       = Right acc
     go !acc (Fail err)  = Left (err, acc)
 
--- | This is like the standard 'map' function on lists, but for 'Entries'. It
+-- | This is like the standard 'Data.List.map' function on lists, but for 'Entries'. It
 -- includes failure as a extra possible outcome of the mapping function.
 --
 -- If your mapping function cannot fail it may be more convenient to use
 -- 'mapEntriesNoFail'
-mapEntries :: (Entry -> Either e' Entry) -> Entries e -> Entries (Either e e')
+mapEntries
+  :: (GenEntry tarPath linkTarget -> Either e' (GenEntry tarPath linkTarget))
+  -- ^ Function to apply to each entry
+  -> GenEntries tarPath linkTarget e
+  -- ^ Input sequence
+  -> GenEntries tarPath linkTarget (Either e e')
 mapEntries f =
-  foldEntries (\entry rest -> either (Fail . Right) (flip Next rest) (f entry)) Done (Fail . Left)
+  foldEntries (\entry rest -> either (Fail . Right) (`Next` rest) (f entry)) Done (Fail . Left)
 
 -- | Like 'mapEntries' but the mapping function itself cannot fail.
 --
-mapEntriesNoFail :: (Entry -> Entry) -> Entries e -> Entries e
+mapEntriesNoFail
+  :: (GenEntry tarPath linkTarget -> GenEntry tarPath linkTarget)
+  -> GenEntries tarPath linkTarget e
+  -> GenEntries tarPath linkTarget e
 mapEntriesNoFail f =
-  foldEntries (\entry -> Next (f entry)) Done Fail
+  foldEntries (Next . f) Done Fail
 
 -- | @since 0.5.1.0
-instance Sem.Semigroup (Entries e) where
+instance Sem.Semigroup (GenEntries tarPath linkTarget e) where
   a <> b = foldEntries Next b Fail a
 
-instance Monoid (Entries e) where
+instance Monoid (GenEntries tarPath linkTarget e) where
   mempty  = Done
   mappend = (Sem.<>)
 
-instance Functor Entries where
-  fmap f = foldEntries Next Done (Fail . f)
-
-instance NFData e => NFData (Entries e) where
+instance (NFData tarPath, NFData linkTarget, NFData e) => NFData (GenEntries tarPath linkTarget e) where
   rnf (Next e es) = rnf e `seq` rnf es
   rnf  Done       = ()
   rnf (Fail e)    = rnf e
-
-
--------------------------
--- QuickCheck instances
---
-
-#ifdef TESTS
-
-instance Arbitrary Entry where
-  arbitrary = Entry <$> arbitrary <*> arbitrary <*> arbitraryPermissions
-                    <*> arbitrary <*> arbitraryEpochTime <*> arbitrary
-    where
-      arbitraryPermissions :: Gen Permissions
-      arbitraryPermissions = fromIntegral <$> (arbitrary :: Gen Word16)
-
-      arbitraryEpochTime :: Gen EpochTime
-      arbitraryEpochTime = arbitraryOctal 11
-
-  shrink (Entry path content perms author time format) =
-      [ Entry path' content' perms author' time' format
-      | (path', content', author', time') <-
-         shrink (path, content, author, time) ]
-   ++ [ Entry path content perms' author time format
-      | perms' <- shrinkIntegral perms ]
-
-instance Arbitrary TarPath where
-  arbitrary = either error id
-            . toTarPath False
-            . FilePath.Posix.joinPath
-          <$> listOf1ToN (255 `div` 5)
-                         (elements (map (replicate 4) "abcd"))
-
-  shrink = map (either error id . toTarPath False)
-         . map FilePath.Posix.joinPath
-         . filter (not . null)
-         . shrinkList shrinkNothing
-         . FilePath.Posix.splitPath
-         . fromTarPathToPosixPath
-
-instance Arbitrary LinkTarget where
-  arbitrary = maybe (error "link target too large") id
-            . toLinkTarget
-            . FilePath.Native.joinPath
-          <$> listOf1ToN (100 `div` 5)
-                         (elements (map (replicate 4) "abcd"))
-
-  shrink = map (maybe (error "link target too large") id . toLinkTarget)
-         . map FilePath.Posix.joinPath
-         . filter (not . null)
-         . shrinkList shrinkNothing
-         . FilePath.Posix.splitPath
-         . fromLinkTargetToPosixPath
-
-
-listOf1ToN :: Int -> Gen a -> Gen [a]
-listOf1ToN n g = sized $ \sz -> do
-    n <- choose (1, min n (max 1 sz))
-    vectorOf n g
-
-listOf0ToN :: Int -> Gen a -> Gen [a]
-listOf0ToN n g = sized $ \sz -> do
-    n <- choose (0, min n sz)
-    vectorOf n g
-
-instance Arbitrary EntryContent where
-  arbitrary =
-    frequency
-      [ (16, do bs <- arbitrary;
-                return (NormalFile bs (LBS.length bs)))
-      , (2, pure Directory)
-      , (1, SymbolicLink    <$> arbitrary)
-      , (1, HardLink        <$> arbitrary)
-      , (1, CharacterDevice <$> arbitraryOctal 7 <*> arbitraryOctal 7)
-      , (1, BlockDevice     <$> arbitraryOctal 7 <*> arbitraryOctal 7)
-      , (1, pure NamedPipe)
-      , (1, do c  <- elements (['A'..'Z']++['a'..'z'])
-               bs <- arbitrary;
-               return (OtherEntryType c bs (LBS.length bs)))
-      ]
-
-  shrink (NormalFile bs _)   = [ NormalFile bs' (LBS.length bs') 
-                               | bs' <- shrink bs ]
-  shrink  Directory          = []
-  shrink (SymbolicLink link) = [ SymbolicLink link' | link' <- shrink link ]
-  shrink (HardLink     link) = [ HardLink     link' | link' <- shrink link ]
-  shrink (CharacterDevice ma mi) = [ CharacterDevice ma' mi'
-                                   | (ma', mi') <- shrink (ma, mi) ]
-  shrink (BlockDevice     ma mi) = [ BlockDevice ma' mi'
-                                   | (ma', mi') <- shrink (ma, mi) ]
-  shrink  NamedPipe              = []
-  shrink (OtherEntryType c bs _) = [ OtherEntryType c bs' (LBS.length bs') 
-                                   | bs' <- shrink bs ]
-
-instance Arbitrary LBS.ByteString where
-  arbitrary = fmap LBS.pack arbitrary
-  shrink    = map LBS.pack . shrink . LBS.unpack
-
-instance Arbitrary BS.ByteString where
-  arbitrary = fmap BS.pack arbitrary
-  shrink    = map BS.pack . shrink . BS.unpack
-
-instance Arbitrary Ownership where
-  arbitrary = Ownership <$> name <*> name
-                        <*> idno <*> idno
-    where
-      -- restrict user/group to posix ^[a-z][-a-z0-9]{0,30}$
-      name = do
-        first <- choose ('a', 'z')
-        rest <- listOf0ToN 30 (oneof [choose ('a', 'z'), choose ('0', '9'), pure '-'])
-        return $ first : rest
-      idno = arbitraryOctal 7
-
-  shrink (Ownership oname gname oid gid) =
-    [ Ownership oname' gname' oid' gid'
-    | (oname', gname', oid', gid') <- shrink (oname, gname, oid, gid) ]
-
-instance Arbitrary Format where
-  arbitrary = elements [V7Format, UstarFormat, GnuFormat]
-
-
---arbitraryOctal :: (Integral n, Random n) => Int -> Gen n
-arbitraryOctal n =
-    oneof [ pure 0
-          , choose (0, upperBound)
-          , pure upperBound
-          ]
-  where
-    upperBound = 8^n-1
-
--- For QC tests it's useful to have a way to limit the info to that which can
--- be expressed in the old V7 format
-limitToV7FormatCompat :: Entry -> Entry
-limitToV7FormatCompat entry@Entry { entryFormat = V7Format } =
-    entry {
-      entryContent = case entryContent entry of
-        CharacterDevice _ _ -> OtherEntryType  '3' LBS.empty 0
-        BlockDevice     _ _ -> OtherEntryType  '4' LBS.empty 0
-        Directory           -> OtherEntryType  '5' LBS.empty 0
-        NamedPipe           -> OtherEntryType  '6' LBS.empty 0
-        other               -> other,
-
-      entryOwnership = (entryOwnership entry) {
-        groupName = "",
-        ownerName = ""
-      },
-
-      entryTarPath = let TarPath name _prefix = entryTarPath entry
-                      in TarPath name BS.empty
-    }
-limitToV7FormatCompat entry = entry
-
-#endif
-

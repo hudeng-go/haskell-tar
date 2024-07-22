@@ -1,3 +1,9 @@
+haskell-tar (0.6.3.0-1deepin1) unstable; urgency=medium
+
+  * Update version to 0.6.3.1
+
+ -- hudeng <hudeng@deepin.org>  Mon, 22 Jul 2024 16:28:54 +0800
+
 haskell-tar (0.5.1.1-deepin1) unstable; urgency=medium
 
   * Rebuild

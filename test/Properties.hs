@@ -1,11 +1,14 @@
+{-# LANGUAGE CPP #-}
+
 module Main where
 
-import qualified Codec.Archive.Tar.Index as Index
-import qualified Codec.Archive.Tar.Index.IntTrie as IntTrie
-import qualified Codec.Archive.Tar.Index.StringTable as StringTable
-import qualified Codec.Archive.Tar       as Tar
-
-import qualified Data.ByteString as BS
+import qualified Codec.Archive.Tar.Index.Tests as Index
+import qualified Codec.Archive.Tar.Index.IntTrie.Tests as IntTrie
+import qualified Codec.Archive.Tar.Index.StringTable.Tests as StringTable
+import qualified Codec.Archive.Tar.Pack.Tests  as Pack
+import qualified Codec.Archive.Tar.Tests       as Tar
+import qualified Codec.Archive.Tar.Types.Tests as Types
+import qualified Codec.Archive.Tar.Unpack.Tests as Unpack
 
 import Test.Tasty
 import Test.Tasty.QuickCheck
@@ -15,10 +18,17 @@ main =
   defaultMain $
     testGroup "tar tests" [
 
-      testGroup "write/read" [
+      testGroup "fromTarPath" [
+        testProperty "fromTarPath" Types.prop_fromTarPath,
+        testProperty "fromTarPathToPosixPath" Types.prop_fromTarPathToPosixPath,
+        testProperty "fromTarPathToWindowsPath" Types.prop_fromTarPathToWindowsPath
+      ]
+
+    , testGroup "write/read" [
         testProperty "ustar format" Tar.prop_write_read_ustar,
         testProperty "gnu format"   Tar.prop_write_read_gnu,
-        testProperty "v7 format"    Tar.prop_write_read_v7
+        testProperty "v7 format"    Tar.prop_write_read_v7,
+        testProperty "large filesize" Tar.prop_large_filesize
       ]
 
     , testGroup "string table" [
@@ -47,8 +57,22 @@ main =
         testProperty "toList"      Index.prop_toList,
         testProperty "serialise"   Index.prop_serialise_deserialise,
         testProperty "size"        Index.prop_serialiseSize,
+#ifdef MIN_VERSION_bytestring_handle
         testProperty "matches tar" Index.prop_index_matches_tar,
+#endif
         testProperty "unfinalise"  Index.prop_finalise_unfinalise
       ]
-    ]
 
+    , testGroup "pack" [
+      adjustOption (\(QuickCheckMaxRatio n) -> QuickCheckMaxRatio (max n 100)) $
+      testProperty "roundtrip" Pack.prop_roundtrip,
+      testProperty "unicode" Pack.unit_roundtrip_unicode,
+      testProperty "symlink" Pack.unit_roundtrip_symlink,
+      testProperty "long filepath" Pack.unit_roundtrip_long_filepath,
+      testProperty "long symlink" Pack.unit_roundtrip_long_symlink
+      ]
+
+    , testGroup "unpack" [
+      testProperty "modtime 1970-01-01" Unpack.case_modtime_1970
+      ]
+    ]
